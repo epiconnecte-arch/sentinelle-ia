@@ -1,6 +1,6 @@
 # ============================================================
-# SENTINELLE-IA — API Flask complète
-# Routes : /analyser  /dashboard  /vocal
+# SENTINELLE-IA — API Flask complète v2
+# Routes : /analyser  /dashboard  /vocal  /test-vocal
 # ============================================================
 
 from flask import Flask, request, jsonify, render_template_string
@@ -9,21 +9,13 @@ from datetime import datetime
 
 app = Flask(__name__)
 
-# ── Clés depuis variables d'environnement Render ─────────────
 ANTHROPIC_KEY  = os.environ.get("ANTHROPIC_API_KEY")
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT  = os.environ.get("TELEGRAM_CHAT_ID")
 client         = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
 
-# ── Mémoire partagée des dernières données capteurs ──────────
-# Ce dictionnaire est mis à jour à chaque appel /analyser
-# et lu par /vocal pour que SENTINELLE connaisse
-# toujours les valeurs en temps réel
 derniere_donnee = {}
 
-# ════════════════════════════════════════════════════════════
-# PROMPT SYSTÈME — Analyse automatique des capteurs
-# ════════════════════════════════════════════════════════════
 PROMPT_ANALYSE = """Tu es SENTINELLE-IA, assistant de sécurité industrielle.
 Tu reçois des données capteurs d'un travailleur en zone hostile.
 Analyse les risques et réponds UNIQUEMENT en JSON valide, sans markdown :
@@ -33,7 +25,6 @@ Analyse les risques et réponds UNIQUEMENT en JSON valide, sans markdown :
   "alerte_telegram": true ou false,
   "details": "explication technique en 1 phrase"
 }
-
 Seuils critiques :
 - gaz > 1500 → DANGER
 - total_g > 2.5 → DANGER (chute détectée)
@@ -42,9 +33,6 @@ Seuils critiques :
 - bpm > 120 ou bpm < 40 (si contact_ok=true) → ATTENTION
 - Tout va bien → OK"""
 
-# ════════════════════════════════════════════════════════════
-# FONCTION UTILITAIRE — Envoi alerte Telegram
-# ════════════════════════════════════════════════════════════
 def envoyer_telegram(texte):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT:
         print("Telegram non configuré")
@@ -59,19 +47,12 @@ def envoyer_telegram(texte):
     except Exception as e:
         print(f"Erreur Telegram : {e}")
 
-# ════════════════════════════════════════════════════════════
-# ROUTE 1 — /analyser (POST)
-# Reçoit le JSON de l'ESP-32, appelle Claude, renvoie analyse
-# ════════════════════════════════════════════════════════════
 @app.route("/analyser", methods=["POST"])
 def analyser():
     global derniere_donnee
     data = request.get_json()
-
-    # Horodatage et sauvegarde en mémoire
     derniere_donnee = {**data, "timestamp": datetime.now().strftime("%H:%M:%S")}
 
-    # Appel Claude pour analyse
     try:
         reponse = client.messages.create(
             model="claude-sonnet-4-5",
@@ -82,10 +63,8 @@ def analyser():
                 "content": f"Données capteurs : {json.dumps(data, ensure_ascii=False)}"
             }]
         )
-        texte = reponse.content[0].text
-
-        # Nettoyage au cas où Claude ajouterait des backticks
-        texte = texte.replace("```json", "").replace("```", "").strip()
+        texte   = reponse.content[0].text
+        texte   = texte.replace("```json", "").replace("```", "").strip()
         analyse = json.loads(texte)
 
     except Exception as e:
@@ -99,40 +78,32 @@ def analyser():
 
     derniere_donnee["analyse"] = analyse
 
-    # Alerte Telegram si danger détecté
     if analyse.get("alerte_telegram"):
-        emoji = "🚨" if analyse["niveau"] == "DANGER" else "⚠️"
-        lat     = data.get("lat", 0)
-        lng     = data.get("lng", 0)
-        gps_ok  = data.get("gps_fix", False)
-        maps    = f"https://maps.google.com/?q={lat},{lng}" if gps_ok else "GPS non fixé"
-
+        emoji  = "🚨" if analyse["niveau"] == "DANGER" else "⚠️"
+        lat    = data.get("lat", 0)
+        lng    = data.get("lng", 0)
+        gps_ok = data.get("gps_fix", False)
+        maps   = f"https://maps.google.com/?q={lat},{lng}" if gps_ok else "GPS non fixé"
         msg = (
             f"{emoji} <b>SENTINELLE-IA — {analyse['niveau']}</b>\n"
             f"━━━━━━━━━━━━━━━━━━\n"
             f"📋 {analyse['message']}\n\n"
-            f"🌡 Temp. ambiante  : {data.get('temp_amb', 'N/A')}°C\n"
+            f"🌡 Temp. ambiante   : {data.get('temp_amb', 'N/A')}°C\n"
             f"🤒 Temp. corporelle : {data.get('temp_corps', 'N/A')}°C\n"
-            f"💨 Gaz (brut)      : {data.get('gaz', 'N/A')}\n"
-            f"💓 Fréq. cardiaque : {data.get('bpm', 'N/A')} BPM\n"
-            f"⚡ Accélération    : {data.get('total_g', 'N/A')}g\n"
-            f"📍 Position        : {maps}\n"
-            f"🕐 Heure           : {derniere_donnee['timestamp']}"
+            f"💨 Gaz (brut)       : {data.get('gaz', 'N/A')}\n"
+            f"💓 Fréq. cardiaque  : {data.get('bpm', 'N/A')} BPM\n"
+            f"⚡ Accélération     : {data.get('total_g', 'N/A')}g\n"
+            f"📍 Position         : {maps}\n"
+            f"🕐 Heure            : {derniere_donnee['timestamp']}"
         )
         envoyer_telegram(msg)
 
     return jsonify(analyse)
 
-# ════════════════════════════════════════════════════════════
-# ROUTE 2 — /vocal (POST)
-# Reçoit une question du travailleur, répond en langage parlé
-# ════════════════════════════════════════════════════════════
 @app.route("/vocal", methods=["POST"])
 def vocal():
     data     = request.get_json()
     question = data.get("question", "")
-
-    # Utilise les dernières données capteurs connues
     capteurs = derniere_donnee if derniere_donnee else data.get("capteurs", {})
 
     prompt_contexte = f"""Tu es SENTINELLE, l'assistant vocal de sécurité d'un travailleur.
@@ -141,14 +112,14 @@ Pas de markdown, pas de symboles spéciaux, pas de listes.
 Sois direct et rassurant sauf en cas de danger réel.
 
 Données capteurs en temps réel :
-- Température ambiante  : {capteurs.get('temp_amb', 'N/A')}°C
+- Température ambiante   : {capteurs.get('temp_amb', 'N/A')}°C
 - Température corporelle : {capteurs.get('temp_corps', 'N/A')}°C
-- Humidité              : {capteurs.get('humidity', 'N/A')}%
-- Niveau de gaz         : {capteurs.get('gaz', 'N/A')} (seuil danger : 1500)
-- Fréquence cardiaque   : {capteurs.get('bpm', 'N/A')} BPM
-- Accélération totale   : {capteurs.get('total_g', 'N/A')}g
-- Distance objet proche : {capteurs.get('distance', 'N/A')} cm
-- GPS fixé              : {capteurs.get('gps_fix', False)}"""
+- Humidité               : {capteurs.get('humidity', 'N/A')}%
+- Niveau de gaz          : {capteurs.get('gaz', 'N/A')} (seuil danger : 1500)
+- Fréquence cardiaque    : {capteurs.get('bpm', 'N/A')} BPM
+- Accélération totale    : {capteurs.get('total_g', 'N/A')}g
+- Distance objet proche  : {capteurs.get('distance', 'N/A')} cm
+- GPS fixé               : {capteurs.get('gps_fix', False)}"""
 
     try:
         reponse = client.messages.create(
@@ -163,10 +134,43 @@ Données capteurs en temps réel :
 
     return jsonify({"reponse": texte})
 
-# ════════════════════════════════════════════════════════════
-# ROUTE 3 — /dashboard (GET)
-# Page HTML auto-refresh toutes les 3 secondes
-# ════════════════════════════════════════════════════════════
+@app.route("/test-vocal")
+def test_vocal():
+    return """<!DOCTYPE html>
+<html><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<style>
+body{background:#000;color:#fff;font-family:monospace;padding:20px;}
+button{background:#238636;color:#fff;border:none;padding:15px 30px;
+font-size:1.2em;border-radius:8px;margin:10px 0;}
+#log{background:#111;padding:10px;border-radius:5px;margin-top:10px;
+min-height:100px;white-space:pre-wrap;font-size:0.9em;}
+</style></head>
+<body>
+<h2>Test Reconnaissance Vocale</h2>
+<button onclick="tester()">Appuyer et parler</button>
+<div id="log">En attente...</div>
+<script>
+function log(msg) {
+  document.getElementById('log').textContent += msg + '\\n';
+}
+function tester() {
+  log('Démarrage...');
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!SR) { log('ERREUR: SpeechRecognition non disponible !'); return; }
+  log('OK: SpeechRecognition disponible');
+  const r = new SR();
+  r.lang = 'fr-FR';
+  r.interimResults = false;
+  r.onstart  = () => log('OK: Micro activé — parlez !');
+  r.onresult = (e) => log('OK: Transcription : ' + e.results[0][0].transcript);
+  r.onerror  = (e) => log('ERREUR: ' + e.error);
+  r.onend    = () => log('Fin écoute');
+  r.start();
+}
+</script>
+</body></html>"""
+
 DASHBOARD_HTML = """<!DOCTYPE html>
 <html lang="fr">
 <head>
@@ -183,7 +187,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     }
     h1 { color: #58a6ff; margin-bottom: 20px; font-size: 1.4em; }
     h2 { color: #8b949e; font-size: 1em; margin-bottom: 12px; }
-
     .statut {
       padding: 15px 20px; border-radius: 8px;
       margin-bottom: 20px; font-size: 1.1em; font-weight: bold;
@@ -191,7 +194,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     .statut.danger  { background:#2d1b1b; border:2px solid #f85149; color:#f85149; }
     .statut.warning { background:#2d2208; border:2px solid #e3b341; color:#e3b341; }
     .statut.ok      { background:#1b2d1b; border:2px solid #3fb950; color:#3fb950; }
-
     .grille {
       display: grid;
       grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
@@ -201,10 +203,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       background: #161b22; border: 1px solid #30363d;
       border-radius: 8px; padding: 15px; text-align: center;
     }
-    .carte .val  { font-size: 1.6em; font-weight: bold; color: #58a6ff; }
-    .carte .nom  { font-size: 0.8em; color: #8b949e; margin-top: 5px; }
-
-    /* ── Interface vocale ── */
+    .carte .val { font-size: 1.6em; font-weight: bold; color: #58a6ff; }
+    .carte .nom { font-size: 0.8em; color: #8b949e; margin-top: 5px; }
     #vocal-section {
       background: #161b22; border: 1px solid #30363d;
       border-radius: 8px; padding: 20px;
@@ -226,7 +226,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     }
     #transcription { color: #8b949e; font-style: italic; margin: 8px 0; }
     #reponse-ia    { color: #58a6ff; font-size: 1.05em; margin: 8px 0; min-height: 24px; }
-
     .timestamp { color: #444; font-size: 0.8em; margin-top: 10px; }
     a { color: #58a6ff; }
   </style>
@@ -235,8 +234,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   <h1>🛡️ SENTINELLE-IA — Surveillance temps réel</h1>
 
   {% if data %}
-
-  <!-- Statut IA -->
   <div class="statut {{ niveau_class }}">
     {% if data.analyse %}
       {{ '🚨' if data.analyse.niveau == 'DANGER' else ('⚠️' if data.analyse.niveau == 'ATTENTION' else '✅') }}
@@ -245,8 +242,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       ✅ En attente d'analyse...
     {% endif %}
   </div>
-
-  <!-- Cartes capteurs -->
   <div class="grille">
     <div class="carte">
       <div class="val">{{ data.temp_amb }}°C</div>
@@ -293,8 +288,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       {% endif %}
     </div>
   </div>
+  {% else %}
+  <div class="statut ok">En attente des données de l'ESP-32...</div>
+  {% endif %}
 
-  <!-- Interface vocale -->
   <div id="vocal-section">
     <h2>🎙️ Parler à SENTINELLE</h2>
     <p style="color:#8b949e; font-size:0.9em">
@@ -306,14 +303,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <p id="reponse-ia"></p>
   </div>
 
+  {% if data %}
   <p class="timestamp">Dernière mise à jour : {{ data.timestamp }}</p>
-
-  {% else %}
-  <div class="statut ok">En attente des données de l'ESP-32...</div>
   {% endif %}
 
 <script>
-// Données capteurs injectées par Flask (toujours à jour grâce au refresh 3s)
 const CAPTEURS = {
   temp_amb:   {{ data.temp_amb   if data else 0 }},
   temp_corps: {{ data.temp_corps if data else 0 }},
@@ -325,24 +319,19 @@ const CAPTEURS = {
   gps_fix:    {{ 'true' if data and data.gps_fix else 'false' }}
 };
 
-// ── Speech-to-Text ───────────────────────────────────────────
-// ── Speech-to-Text corrigé ────────────────────────────────
 let recognition = null;
 let enEcoute = false;
 
 function demarrerReconnaissance() {
-  const SpeechRecognition = window.SpeechRecognition
-                         || window.webkitSpeechRecognition;
-
-  if (!SpeechRecognition) {
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!SR) {
     document.getElementById('transcription').textContent =
       "Non supporté — utilisez Chrome";
     return;
   }
-
-  recognition = new SpeechRecognition();
-  recognition.lang           = 'fr-FR';
-  recognition.interimResults = false;
+  recognition = new SR();
+  recognition.lang            = 'fr-FR';
+  recognition.interimResults  = false;
   recognition.maxAlternatives = 1;
 
   recognition.onstart = () => {
@@ -352,15 +341,14 @@ function demarrerReconnaissance() {
 
   recognition.onresult = async (event) => {
     const question = event.results[0][0].transcript;
-    document.getElementById('transcription').textContent = `"${question}"`;
-    document.getElementById('reponse-ia').textContent = "SENTINELLE réfléchit...";
+    document.getElementById('transcription').textContent = '"' + question + '"';
+    document.getElementById('reponse-ia').textContent    = "SENTINELLE réfléchit...";
     document.getElementById('btn-parler').classList.remove('ecoute');
     enEcoute = false;
     await interrogerSentinelle(question);
   };
 
   recognition.onerror = (e) => {
-    console.error("Erreur reconnaissance:", e.error);
     document.getElementById('transcription').textContent = "Erreur : " + e.error;
     document.getElementById('btn-parler').classList.remove('ecoute');
     enEcoute = false;
@@ -384,7 +372,6 @@ function basculerEcoute() {
   }
 }
 
-// ── Appel /vocal ─────────────────────────────────────────────
 async function interrogerSentinelle(question) {
   try {
     const res = await fetch('/vocal', {
@@ -398,28 +385,22 @@ async function interrogerSentinelle(question) {
     lireAVoixHaute(reponse);
   } catch (err) {
     document.getElementById('reponse-ia').textContent = "Erreur de connexion.";
-    console.error(err);
   }
 }
 
-// ── Text-to-Speech ───────────────────────────────────────────
 function lireAVoixHaute(texte) {
   const synth = window.speechSynthesis;
   synth.cancel();
-
-  // Petit délai nécessaire sur Android Chrome
   setTimeout(() => {
-    const u   = new SpeechSynthesisUtterance(texte);
-    u.lang    = 'fr-FR';
-    u.rate    = 0.95;
-    u.pitch   = 1.0;
-    u.volume  = 1.0;
-
-    const voix = synth.getVoices();
+    const u  = new SpeechSynthesisUtterance(texte);
+    u.lang   = 'fr-FR';
+    u.rate   = 0.95;
+    u.pitch  = 1.0;
+    u.volume = 1.0;
+    const voix   = synth.getVoices();
     const voixFR = voix.find(v => v.lang === 'fr-FR')
                 || voix.find(v => v.lang.startsWith('fr'));
     if (voixFR) u.voice = voixFR;
-
     synth.speak(u);
   }, 300);
 }
@@ -432,7 +413,7 @@ def dashboard():
     niveau_class = "ok"
     if derniere_donnee.get("analyse"):
         n = derniere_donnee["analyse"].get("niveau", "OK")
-        niveau_class = {"DANGER": "danger", "ATTENTION": "warning", "OK": "ok"}.get(n, "ok")
+        niveau_class = {"DANGER":"danger","ATTENTION":"warning","OK":"ok"}.get(n,"ok")
     return render_template_string(
         DASHBOARD_HTML,
         data=derniere_donnee if derniere_donnee else None,
@@ -445,42 +426,7 @@ def index():
     🛡️ SENTINELLE-IA API<br><br>
     <a href='/dashboard' style='color:#3fb950'>→ Ouvrir le Dashboard</a>
     </h2>"""
-@app.route("/test-vocal")
-def test_vocal():
-    return """<!DOCTYPE html>
-<html><head><meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<style>
-body{background:#000;color:#fff;font-family:monospace;padding:20px;}
-button{background:#238636;color:#fff;border:none;padding:15px 30px;
-font-size:1.2em;border-radius:8px;margin:10px 0;}
-#log{background:#111;padding:10px;border-radius:5px;margin-top:10px;
-min-height:100px;white-space:pre-wrap;font-size:0.9em;}
-</style></head>
-<body>
-<h2>🎤 Test Reconnaissance Vocale</h2>
-<button onclick="tester()">Appuyer et parler</button>
-<div id="log">En attente...</div>
-<script>
-function log(msg) {
-  document.getElementById('log').textContent += msg + '\\n';
-}
-function tester() {
-  log('→ Démarrage...');
-  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-  if (!SR) { log('❌ SpeechRecognition non disponible !'); return; }
-  log('✅ SpeechRecognition disponible');
-  const r = new SR();
-  r.lang = 'fr-FR';
-  r.interimResults = false;
-  r.onstart  = () => log('✅ Micro activé — parlez !');
-  r.onresult = (e) => log('✅ Transcription : ' + e.results[0][0].transcript);
-  r.onerror  = (e) => log('❌ Erreur : ' + e.error);
-  r.onend    = () => log('→ Fin écoute');
-  r.start();
-}
-</script>
-</body></html>"""
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False)
