@@ -445,7 +445,42 @@ def index():
     🛡️ SENTINELLE-IA API<br><br>
     <a href='/dashboard' style='color:#3fb950'>→ Ouvrir le Dashboard</a>
     </h2>"""
-
+@app.route("/test-vocal")
+def test_vocal():
+    return """<!DOCTYPE html>
+<html><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<style>
+body{background:#000;color:#fff;font-family:monospace;padding:20px;}
+button{background:#238636;color:#fff;border:none;padding:15px 30px;
+font-size:1.2em;border-radius:8px;margin:10px 0;}
+#log{background:#111;padding:10px;border-radius:5px;margin-top:10px;
+min-height:100px;white-space:pre-wrap;font-size:0.9em;}
+</style></head>
+<body>
+<h2>🎤 Test Reconnaissance Vocale</h2>
+<button onclick="tester()">Appuyer et parler</button>
+<div id="log">En attente...</div>
+<script>
+function log(msg) {
+  document.getElementById('log').textContent += msg + '\\n';
+}
+function tester() {
+  log('→ Démarrage...');
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!SR) { log('❌ SpeechRecognition non disponible !'); return; }
+  log('✅ SpeechRecognition disponible');
+  const r = new SR();
+  r.lang = 'fr-FR';
+  r.interimResults = false;
+  r.onstart  = () => log('✅ Micro activé — parlez !');
+  r.onresult = (e) => log('✅ Transcription : ' + e.results[0][0].transcript);
+  r.onerror  = (e) => log('❌ Erreur : ' + e.error);
+  r.onend    = () => log('→ Fin écoute');
+  r.start();
+}
+</script>
+</body></html>"""
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False)
