@@ -326,21 +326,44 @@ const CAPTEURS = {
 };
 
 // ── Speech-to-Text ───────────────────────────────────────────
-const SpeechRecognition = window.SpeechRecognition
-                       || window.webkitSpeechRecognition;
+// ── Speech-to-Text corrigé ────────────────────────────────
 let recognition = null;
-let enEcoute    = false;
+let enEcoute = false;
 
-if (SpeechRecognition) {
+function demarrerReconnaissance() {
+  const SpeechRecognition = window.SpeechRecognition
+                         || window.webkitSpeechRecognition;
+
+  if (!SpeechRecognition) {
+    document.getElementById('transcription').textContent =
+      "Non supporté — utilisez Chrome";
+    return;
+  }
+
   recognition = new SpeechRecognition();
   recognition.lang           = 'fr-FR';
   recognition.interimResults = false;
+  recognition.maxAlternatives = 1;
+
+  recognition.onstart = () => {
+    document.getElementById('transcription').textContent = "Je vous écoute...";
+    document.getElementById('btn-parler').classList.add('ecoute');
+  };
 
   recognition.onresult = async (event) => {
     const question = event.results[0][0].transcript;
     document.getElementById('transcription').textContent = `"${question}"`;
-    document.getElementById('reponse-ia').textContent    = "SENTINELLE réfléchit...";
+    document.getElementById('reponse-ia').textContent = "SENTINELLE réfléchit...";
+    document.getElementById('btn-parler').classList.remove('ecoute');
+    enEcoute = false;
     await interrogerSentinelle(question);
+  };
+
+  recognition.onerror = (e) => {
+    console.error("Erreur reconnaissance:", e.error);
+    document.getElementById('transcription').textContent = "Erreur : " + e.error;
+    document.getElementById('btn-parler').classList.remove('ecoute');
+    enEcoute = false;
   };
 
   recognition.onend = () => {
@@ -348,26 +371,16 @@ if (SpeechRecognition) {
     enEcoute = false;
   };
 
-  recognition.onerror = (e) => {
-    document.getElementById('transcription').textContent = "Erreur micro : " + e.error;
-    document.getElementById('btn-parler').classList.remove('ecoute');
-    enEcoute = false;
-  };
-} else {
-  document.getElementById('btn-parler').disabled = true;
-  document.getElementById('transcription').textContent =
-    "Reconnaissance vocale non supportée — utilisez Chrome";
+  recognition.start();
+  enEcoute = true;
 }
 
 function basculerEcoute() {
-  if (!recognition) return;
-  if (enEcoute) {
+  if (enEcoute && recognition) {
     recognition.stop();
+    enEcoute = false;
   } else {
-    recognition.start();
-    document.getElementById('btn-parler').classList.add('ecoute');
-    document.getElementById('transcription').textContent = "Je vous écoute...";
-    enEcoute = true;
+    demarrerReconnaissance();
   }
 }
 
@@ -385,6 +398,7 @@ async function interrogerSentinelle(question) {
     lireAVoixHaute(reponse);
   } catch (err) {
     document.getElementById('reponse-ia').textContent = "Erreur de connexion.";
+    console.error(err);
   }
 }
 
@@ -392,13 +406,22 @@ async function interrogerSentinelle(question) {
 function lireAVoixHaute(texte) {
   const synth = window.speechSynthesis;
   synth.cancel();
-  const u   = new SpeechSynthesisUtterance(texte);
-  u.lang    = 'fr-FR';
-  u.rate    = 0.95;
-  u.pitch   = 1.0;
-  const voixFR = synth.getVoices().find(v => v.lang.startsWith('fr'));
-  if (voixFR) u.voice = voixFR;
-  synth.speak(u);
+
+  // Petit délai nécessaire sur Android Chrome
+  setTimeout(() => {
+    const u   = new SpeechSynthesisUtterance(texte);
+    u.lang    = 'fr-FR';
+    u.rate    = 0.95;
+    u.pitch   = 1.0;
+    u.volume  = 1.0;
+
+    const voix = synth.getVoices();
+    const voixFR = voix.find(v => v.lang === 'fr-FR')
+                || voix.find(v => v.lang.startsWith('fr'));
+    if (voixFR) u.voice = voixFR;
+
+    synth.speak(u);
+  }, 300);
 }
 </script>
 </body>
