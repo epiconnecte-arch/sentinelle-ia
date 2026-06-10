@@ -74,7 +74,7 @@ def analyser():
     # Appel Claude pour analyse
     try:
         reponse = client.messages.create(
-            model="claude-sonnet-4-20250514",
+            model="claude-sonnet-4-5",
             max_tokens=300,
             system=PROMPT_ANALYSE,
             messages=[{
@@ -152,7 +152,7 @@ Données capteurs en temps réel :
 
     try:
         reponse = client.messages.create(
-            model="claude-sonnet-4-20250514",
+            model="claude-sonnet-4-5",
             max_tokens=150,
             system=prompt_contexte,
             messages=[{"role": "user", "content": question}]
