@@ -1,5 +1,5 @@
 # ============================================================
-# SENTINELLE-IA — API Flask complète v2
+# SENTINELLE-IA — API Flask complète v3
 # Routes : /analyser  /dashboard  /vocal  /test-vocal
 # ============================================================
 
@@ -161,9 +161,12 @@ function tester() {
   log('OK: SpeechRecognition disponible');
   const r = new SR();
   r.lang = 'fr-FR';
-  r.interimResults = false;
+  r.interimResults = true;
   r.onstart  = () => log('OK: Micro activé — parlez !');
-  r.onresult = (e) => log('OK: Transcription : ' + e.results[0][0].transcript);
+  r.onresult = (e) => {
+    const t = e.results[e.results.length-1][0].transcript;
+    log('Transcription : ' + t);
+  };
   r.onerror  = (e) => log('ERREUR: ' + e.error);
   r.onend    = () => log('Fin écoute');
   r.start();
@@ -224,7 +227,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       0%   { box-shadow: 0 0 0 0 rgba(248,81,73,0.5); }
       100% { box-shadow: 0 0 0 15px rgba(248,81,73,0); }
     }
-    #transcription { color: #8b949e; font-style: italic; margin: 8px 0; }
+    #transcription { color: #8b949e; font-style: italic; margin: 8px 0; min-height: 24px; }
     #reponse-ia    { color: #58a6ff; font-size: 1.05em; margin: 8px 0; min-height: 24px; }
     .timestamp { color: #444; font-size: 0.8em; margin-top: 10px; }
     a { color: #58a6ff; }
@@ -320,7 +323,7 @@ const CAPTEURS = {
 };
 
 let recognition = null;
-let enEcoute = false;
+let enEcoute    = false;
 
 function demarrerReconnaissance() {
   const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
@@ -329,10 +332,12 @@ function demarrerReconnaissance() {
       "Non supporté — utilisez Chrome";
     return;
   }
+
   recognition = new SR();
   recognition.lang            = 'fr-FR';
-  recognition.interimResults  = false;
+  recognition.interimResults  = true;
   recognition.maxAlternatives = 1;
+  recognition.continuous      = false;
 
   recognition.onstart = () => {
     document.getElementById('transcription').textContent = "Je vous écoute...";
@@ -340,12 +345,19 @@ function demarrerReconnaissance() {
   };
 
   recognition.onresult = async (event) => {
-    const question = event.results[0][0].transcript;
+    const dernier  = event.results[event.results.length - 1];
+    const question = dernier[0].transcript;
+
+    // Affiche la transcription en temps réel pendant que l'utilisateur parle
     document.getElementById('transcription').textContent = '"' + question + '"';
-    document.getElementById('reponse-ia').textContent    = "SENTINELLE réfléchit...";
-    document.getElementById('btn-parler').classList.remove('ecoute');
-    enEcoute = false;
-    await interrogerSentinelle(question);
+
+    // N'envoie à Claude que quand la phrase est finale
+    if (dernier.isFinal) {
+      document.getElementById('reponse-ia').textContent = "SENTINELLE réfléchit...";
+      document.getElementById('btn-parler').classList.remove('ecoute');
+      enEcoute = false;
+      await interrogerSentinelle(question);
+    }
   };
 
   recognition.onerror = (e) => {
