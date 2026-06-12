@@ -337,7 +337,7 @@ function demarrerReconnaissance() {
   recognition.lang            = 'fr-FR';
   recognition.interimResults  = true;
   recognition.maxAlternatives = 1;
-  recognition.continuous      = false;
+  recognition.continuous      = true;
 
   recognition.onstart = () => {
     document.getElementById('transcription').textContent = "Je vous écoute...";
@@ -353,11 +353,12 @@ function demarrerReconnaissance() {
 
     // N'envoie à Claude que quand la phrase est finale
     if (dernier.isFinal) {
-      document.getElementById('reponse-ia').textContent = "SENTINELLE réfléchit...";
-      document.getElementById('btn-parler').classList.remove('ecoute');
-      enEcoute = false;
-      await interrogerSentinelle(question);
-    }
+  document.getElementById('reponse-ia').textContent = "SENTINELLE réfléchit...";
+  document.getElementById('btn-parler').classList.remove('ecoute');
+  enEcoute = false;
+  recognition.stop();
+  await interrogerSentinelle(question);
+}
   };
 
   recognition.onerror = (e) => {
