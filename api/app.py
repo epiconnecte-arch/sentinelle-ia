@@ -151,165 +151,156 @@ min-height:100px;white-space:pre-wrap;font-size:0.9em;}
 <button onclick="tester()">Appuyer et parler</button>
 <div id="log">En attente...</div>
 <script>
-function log(msg) {
-  document.getElementById('log').textContent += msg + '\\n';
-}
-function tester() {
-  log('Démarrage...');
+const CAPTEURS = {
+  temp_amb:   {{ data.temp_amb   if data else 0 }},
+  temp_corps: {{ data.temp_corps if data else 0 }},
+  humidity:   {{ data.humidity   if data else 0 }},
+  gaz:        {{ data.gaz        if data else 0 }},
+  bpm:        {{ data.bpm        if data else 0 }},
+  total_g:    {{ data.total_g    if data else 0 }},
+  distance:   {{ data.distance   if data else 0 }},
+  gps_fix:    {{ 'true' if data and data.gps_fix else 'false' }}
+};
+
+let recognition = null;
+let enEcoute    = false;
+let silenceTimer = null;
+
+function demarrerReconnaissance() {
   const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-  if (!SR) { log('ERREUR: SpeechRecognition non disponible !'); return; }
-  log('OK: SpeechRecognition disponible');
-  const r = new SR();
-  r.lang = 'fr-FR';
-  r.interimResults = true;
-  r.onstart  = () => log('OK: Micro activé — parlez !');
-  r.onresult = (e) => {
-    const t = e.results[e.results.length-1][0].transcript;
-    log('Transcription : ' + t);
+  if (!SR) {
+    document.getElementById('transcription').textContent =
+      "Non supporté — utilisez Chrome";
+    return;
+  }
+
+  recognition = new SR();
+  recognition.lang            = 'fr-FR';
+  recognition.interimResults  = true;
+  recognition.maxAlternatives = 1;
+  recognition.continuous      = true;
+
+  recognition.onstart = () => {
+    document.getElementById('transcription').textContent = "Je vous écoute...";
+    document.getElementById('btn-parler').classList.add('ecoute');
+    document.getElementById('reponse-ia').textContent = "";
   };
-  r.onerror  = (e) => log('ERREUR: ' + e.error);
-  r.onend    = () => log('Fin écoute');
-  r.start();
+
+  recognition.onresult = async (event) => {
+    // Annule le timer de silence précédent
+    if (silenceTimer) clearTimeout(silenceTimer);
+
+    const dernier  = event.results[event.results.length - 1];
+    const question = dernier[0].transcript;
+
+    // Affiche en temps réel
+    document.getElementById('transcription').textContent = '"' + question + '"';
+
+    // Attend 1.5 secondes de silence avant d'envoyer
+    silenceTimer = setTimeout(async () => {
+      if (question.trim().length > 0) {
+        document.getElementById('reponse-ia').textContent = "SENTINELLE réfléchit...";
+        document.getElementById('btn-parler').classList.remove('ecoute');
+        enEcoute = false;
+        recognition.stop();
+        await interrogerSentinelle(question);
+      }
+    }, 1500);
+  };
+
+  recognition.onerror = (e) => {
+    // Ignore l'erreur no-speech, relance l'écoute
+    if (e.error === 'no-speech') {
+      recognition.stop();
+      if (enEcoute) recognition.start();
+      return;
+    }
+    document.getElementById('transcription').textContent = "Erreur : " + e.error;
+    document.getElementById('btn-parler').classList.remove('ecoute');
+    enEcoute = false;
+  };
+
+  recognition.onend = () => {
+    // Relance automatiquement si toujours en écoute
+    if (enEcoute) {
+      try { recognition.start(); } catch(e) {}
+    } else {
+      document.getElementById('btn-parler').classList.remove('ecoute');
+    }
+  };
+
+  recognition.start();
+  enEcoute = true;
 }
-</script>
-</body></html>"""
 
-DASHBOARD_HTML = """<!DOCTYPE html>
-<html lang="fr">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta http-equiv="refresh" content="3">
-  <title>SENTINELLE-IA</title>
-  <style>
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    body {
-      font-family: 'Courier New', monospace;
-      background: #0d1117; color: #c9d1d9;
-      padding: 20px; min-height: 100vh;
-    }
-    h1 { color: #58a6ff; margin-bottom: 20px; font-size: 1.4em; }
-    h2 { color: #8b949e; font-size: 1em; margin-bottom: 12px; }
-    .statut {
-      padding: 15px 20px; border-radius: 8px;
-      margin-bottom: 20px; font-size: 1.1em; font-weight: bold;
-    }
-    .statut.danger  { background:#2d1b1b; border:2px solid #f85149; color:#f85149; }
-    .statut.warning { background:#2d2208; border:2px solid #e3b341; color:#e3b341; }
-    .statut.ok      { background:#1b2d1b; border:2px solid #3fb950; color:#3fb950; }
-    .grille {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
-      gap: 12px; margin-bottom: 20px;
-    }
-    .carte {
-      background: #161b22; border: 1px solid #30363d;
-      border-radius: 8px; padding: 15px; text-align: center;
-    }
-    .carte .val { font-size: 1.6em; font-weight: bold; color: #58a6ff; }
-    .carte .nom { font-size: 0.8em; color: #8b949e; margin-top: 5px; }
-    #vocal-section {
-      background: #161b22; border: 1px solid #30363d;
-      border-radius: 8px; padding: 20px;
-      text-align: center; margin-bottom: 20px;
-    }
-    #btn-parler {
-      background: #238636; color: white; border: none;
-      border-radius: 50%; width: 80px; height: 80px;
-      font-size: 2em; cursor: pointer; margin: 15px 0;
-      transition: background 0.2s;
-    }
-    #btn-parler.ecoute {
-      background: #f85149;
-      animation: pulse 1s infinite;
-    }
-    @keyframes pulse {
-      0%   { box-shadow: 0 0 0 0 rgba(248,81,73,0.5); }
-      100% { box-shadow: 0 0 0 15px rgba(248,81,73,0); }
-    }
-    #transcription { color: #8b949e; font-style: italic; margin: 8px 0; min-height: 24px; }
-    #reponse-ia    { color: #58a6ff; font-size: 1.05em; margin: 8px 0; min-height: 24px; }
-    .timestamp { color: #444; font-size: 0.8em; margin-top: 10px; }
-    a { color: #58a6ff; }
-  </style>
-</head>
-<body>
-  <h1>🛡️ SENTINELLE-IA — Surveillance temps réel</h1>
+function basculerEcoute() {
+  if (enEcoute) {
+    enEcoute = false;
+    if (silenceTimer) clearTimeout(silenceTimer);
+    if (recognition) recognition.stop();
+    document.getElementById('transcription').textContent = "En attente...";
+    document.getElementById('btn-parler').classList.remove('ecoute');
+  } else {
+    demarrerReconnaissance();
+  }
+}
 
-  {% if data %}
-  <div class="statut {{ niveau_class }}">
-    {% if data.analyse %}
-      {{ '🚨' if data.analyse.niveau == 'DANGER' else ('⚠️' if data.analyse.niveau == 'ATTENTION' else '✅') }}
-      {{ data.analyse.niveau }} — {{ data.analyse.message }}
-    {% else %}
-      ✅ En attente d'analyse...
-    {% endif %}
-  </div>
-  <div class="grille">
-    <div class="carte">
-      <div class="val">{{ data.temp_amb }}°C</div>
-      <div class="nom">🌡 Temp. ambiante</div>
-    </div>
-    <div class="carte">
-      <div class="val">{{ data.temp_corps }}°C</div>
-      <div class="nom">🤒 Temp. corporelle</div>
-    </div>
-    <div class="carte">
-      <div class="val">{{ data.humidity }}%</div>
-      <div class="nom">💧 Humidité</div>
-    </div>
-    <div class="carte">
-      <div class="val">{{ data.gaz }}</div>
-      <div class="nom">💨 Gaz (brut)</div>
-    </div>
-    <div class="carte">
-      <div class="val">{{ data.bpm }}</div>
-      <div class="nom">💓 BPM</div>
-    </div>
-    <div class="carte">
-      <div class="val">{{ data.total_g }}g</div>
-      <div class="nom">⚡ Accélération</div>
-    </div>
-    <div class="carte">
-      <div class="val">{{ data.distance }} cm</div>
-      <div class="nom">📡 Distance objet</div>
-    </div>
-    <div class="carte">
-      <div class="val">{{ '✓' if data.contact_ok else '✗' }}</div>
-      <div class="nom">👆 Contact capteur</div>
-    </div>
-    <div class="carte">
-      {% if data.gps_fix %}
-        <div class="val">📍</div>
-        <div class="nom">
-          <a href="https://maps.google.com/?q={{ data.lat }},{{ data.lng }}"
-             target="_blank">Voir sur Maps</a>
-        </div>
-      {% else %}
-        <div class="val">—</div>
-        <div class="nom">GPS non fixé</div>
-      {% endif %}
-    </div>
-  </div>
-  {% else %}
-  <div class="statut ok">En attente des données de l'ESP-32...</div>
-  {% endif %}
+async function interrogerSentinelle(question) {
+  try {
+    const res = await fetch('/vocal', {
+      method:  'POST',
+      headers: {'Content-Type': 'application/json'},
+      body:    JSON.stringify({ question: question, capteurs: CAPTEURS })
+    });
+    const json    = await res.json();
+    const reponse = json.reponse;
+    document.getElementById('reponse-ia').textContent = reponse;
+    lireAVoixHaute(reponse);
+  } catch (err) {
+    document.getElementById('reponse-ia').textContent = "Erreur de connexion.";
+  }
+}
 
-  <div id="vocal-section">
-    <h2>🎙️ Parler à SENTINELLE</h2>
-    <p style="color:#8b949e; font-size:0.9em">
-      Appuyez sur le bouton et posez votre question à voix haute
-    </p>
-    <br>
-    <button id="btn-parler" onclick="basculerEcoute()">🎤</button>
-    <p id="transcription">En attente...</p>
-    <p id="reponse-ia"></p>
-  </div>
+function lireAVoixHaute(texte) {
+  const synth = window.speechSynthesis;
+  synth.cancel();
 
-  {% if data %}
-  <p class="timestamp">Dernière mise à jour : {{ data.timestamp }}</p>
-  {% endif %}
+  // Charge les voix disponibles
+  function parler(voix) {
+    const u  = new SpeechSynthesisUtterance(texte);
+    u.lang   = 'fr-FR';
+    u.rate   = 0.92;
+    u.pitch  = 1.0;
+    u.volume = 1.0;
 
+    // Cherche une voix française dans cet ordre de préférence
+    const voixFR = voix.find(v => v.lang === 'fr-FR' && v.localService)
+                || voix.find(v => v.lang === 'fr-FR')
+                || voix.find(v => v.lang.startsWith('fr'))
+                || null;
+
+    if (voixFR) {
+      u.voice = voixFR;
+      console.log("Voix utilisée :", voixFR.name, voixFR.lang);
+    } else {
+      console.log("Aucune voix FR trouvée — voix système par défaut");
+    }
+    synth.speak(u);
+  }
+
+  // Sur Android les voix se chargent de façon asynchrone
+  const voixDisponibles = synth.getVoices();
+  if (voixDisponibles.length > 0) {
+    parler(voixDisponibles);
+  } else {
+    // Attend que les voix soient chargées
+    synth.onvoiceschanged = () => {
+      parler(synth.getVoices());
+    };
+    // Fallback après 500ms si onvoiceschanged ne se déclenche pas
+    setTimeout(() => parler(synth.getVoices()), 500);
+  }
+}
 <script>
 const CAPTEURS = {
   temp_amb:   {{ data.temp_amb   if data else 0 }},
