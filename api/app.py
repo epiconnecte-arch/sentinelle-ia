@@ -376,6 +376,10 @@ function lireAVoixHaute(texte) {
 </body>
 </html>"""
 
+@app.route("/dernieres-donnees", methods=["GET"])
+def dernieres_donnees():
+    return jsonify(derniere_donnee if derniere_donnee else {})
+  
 @app.route("/dashboard")
 def dashboard():
     niveau_class = "ok"
