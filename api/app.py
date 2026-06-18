@@ -1,578 +1,610 @@
-# ============================================================
-# SENTINELLE-IA — API Flask complète v4
-# Routes : /analyser  /vocal  /vocal-audio  /detecter-wakeword
-#          /dernieres-donnees  /dashboard  /test-vocal  /
-# ============================================================
+import { useState, useEffect, useRef } from "react";
+import {
+  View, Text, TouchableOpacity, ScrollView,
+  StyleSheet, Vibration, Switch, StatusBar, TextInput
+} from "react-native";
+import * as Speech from "expo-speech";
+import { Audio } from "expo-av";
 
-from flask import Flask, request, jsonify, render_template_string
-import anthropic, requests, os, json, tempfile
-from datetime import datetime
+// ── Configuration ─────────────────────────────────────────────
+const API_URL = "https://insightful-passion-production-76aa.up.railway.app";
+const INTERVALLE_CAPTEURS  = 3000;
+const DUREE_ENREGISTREMENT = 5000;
 
-app = Flask(__name__)
-
-# ── Clés API ──────────────────────────────────────────────────
-ANTHROPIC_KEY  = os.environ.get("ANTHROPIC_API_KEY")
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-TELEGRAM_CHAT  = os.environ.get("TELEGRAM_CHAT_ID")
-OPENAI_KEY     = os.environ.get("OPENAI_API_KEY")
-
-client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
-
-# Client OpenAI optionnel (pour transcription Whisper)
-openai_client = None
-if OPENAI_KEY:
-    try:
-        from openai import OpenAI
-        openai_client = OpenAI(api_key=OPENAI_KEY)
-    except ImportError:
-        print("OpenAI non installé — transcription audio désactivée")
-
-# ── Mémoire partagée ──────────────────────────────────────────
-derniere_donnee = {}
-
-# ── Prompt analyse capteurs ───────────────────────────────────
-PROMPT_ANALYSE = """Tu es SENTINELLE-IA, assistant de sécurité industrielle.
-Tu reçois des données capteurs d'un travailleur en zone hostile.
-Analyse les risques et réponds UNIQUEMENT en JSON valide, sans markdown :
-{
-  "niveau": "OK" ou "ATTENTION" ou "DANGER",
-  "message": "phrase courte pour le dashboard (max 15 mots)",
-  "alerte_telegram": true ou false,
-  "details": "explication technique en 1 phrase"
-}
-Seuils critiques :
-- gaz > 1500 → DANGER
-- total_g > 2.5 → DANGER (chute détectée)
-- temp_corps > 38.5 ET temp_amb > 35 → DANGER (coup de chaleur)
-- temp_amb > 45 → DANGER (environnement hostile)
-- bpm > 120 ou bpm < 40 (si contact_ok=true) → ATTENTION
-- Capteur défaillant (valeur nulle ou aberrante) → ATTENTION
-- Tout va bien → OK"""
-
-# ── Envoi alerte Telegram ─────────────────────────────────────
-def envoyer_telegram(texte):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT:
-        print("Telegram non configuré")
-        return
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    try:
-        requests.post(url, json={
-            "chat_id": TELEGRAM_CHAT,
-            "text": texte,
-            "parse_mode": "HTML"
-        }, timeout=5)
-    except Exception as e:
-        print(f"Erreur Telegram : {e}")
-
-# ── ROUTE 1 — /analyser ───────────────────────────────────────
-# Reçoit JSON de l'ESP-32, appelle Claude, renvoie analyse
-@app.route("/analyser", methods=["POST"])
-def analyser():
-    global derniere_donnee
-    data = request.get_json()
-    derniere_donnee = {**data, "timestamp": datetime.now().strftime("%H:%M:%S")}
-
-    try:
-        reponse = client.messages.create(
-            model="claude-sonnet-4-5",
-            max_tokens=300,
-            system=PROMPT_ANALYSE,
-            messages=[{
-                "role": "user",
-                "content": f"Données capteurs : {json.dumps(data, ensure_ascii=False)}"
-            }]
-        )
-        texte   = reponse.content[0].text
-        texte   = texte.replace("```json", "").replace("```", "").strip()
-        analyse = json.loads(texte)
-
-    except Exception as e:
-        print(f"Erreur Claude : {e}")
-        analyse = {
-            "niveau": "OK",
-            "message": "Analyse temporairement indisponible",
-            "alerte_telegram": False,
-            "details": str(e)
-        }
-
-    derniere_donnee["analyse"] = analyse
-
-    # Alerte Telegram si danger
-    if analyse.get("alerte_telegram"):
-        emoji  = "🚨" if analyse["niveau"] == "DANGER" else "⚠️"
-        lat    = data.get("lat", 0)
-        lng    = data.get("lng", 0)
-        gps_ok = data.get("gps_fix", False)
-        maps   = f"https://maps.google.com/?q={lat},{lng}" if gps_ok else "GPS non fixé"
-        msg = (
-            f"{emoji} <b>SENTINELLE-IA — {analyse['niveau']}</b>\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"📋 {analyse['message']}\n\n"
-            f"🌡 Temp. ambiante   : {data.get('temp_amb', 'N/A')}°C\n"
-            f"🤒 Temp. corporelle : {data.get('temp_corps', 'N/A')}°C\n"
-            f"💨 Gaz (brut)       : {data.get('gaz', 'N/A')}\n"
-            f"💓 Fréq. cardiaque  : {data.get('bpm', 'N/A')} BPM\n"
-            f"⚡ Accélération     : {data.get('total_g', 'N/A')}g\n"
-            f"📍 Position         : {maps}\n"
-            f"🕐 Heure            : {derniere_donnee['timestamp']}"
-        )
-        envoyer_telegram(msg)
-
-    return jsonify(analyse)
-
-# ── ROUTE 2 — /vocal ──────────────────────────────────────────
-# Reçoit une question texte, répond en langage naturel parlé
-@app.route("/vocal", methods=["POST"])
-def vocal():
-    data                 = request.get_json()
-    question             = data.get("question", "")
-    langue               = data.get("langue", "fr")
-    capteurs_defaillants = data.get("capteurs_defaillants", [])
-    capteurs             = derniere_donnee if derniere_donnee else data.get("capteurs", {})
-
-    heure_actuelle = datetime.now().strftime("%H:%M")
-    date_actuelle  = datetime.now().strftime("%d/%m/%Y")
-    langue_forcee  = "Réponds OBLIGATOIREMENT en français." if langue == "fr" \
-                     else "Reply ONLY in English."
-    defaillants_str = ", ".join(capteurs_defaillants) if capteurs_defaillants else "aucun"
-
-    prompt_systeme = f"""Tu es SENTINELLE, assistant vocal de sécurité industrielle.
-
-RÈGLE ABSOLUE N°1 : Réponds D'ABORD DIRECTEMENT à la question posée.
-RÈGLE ABSOLUE N°2 : Seulement APRÈS avoir répondu à la question, tu peux ajouter UNE information complémentaire si elle est vraiment utile.
-RÈGLE ABSOLUE N°3 : Maximum 2 phrases au total.
-RÈGLE ABSOLUE N°4 : {langue_forcee}
-RÈGLE ABSOLUE N°5 : Pas de markdown, pas de listes, langage naturel parlé uniquement.
-
-Exemples de comportement attendu :
-- Question "Quelle heure est-il ?" → "Il est {heure_actuelle}."
-- Question "Quelle est ma température corporelle ?" → "Ta température corporelle est de {capteurs.get('temp_corps', 'N/A')} degrés."
-- Question "Est-ce qu'il y a du gaz ?" → "Le niveau de gaz est à {capteurs.get('gaz', 'N/A')}, {'en dessous' if isinstance(capteurs.get('gaz'), (int, float)) and capteurs.get('gaz', 0) < 1500 else 'au-dessus'} du seuil de danger."
-- Question "Comment je vais ?" → Résumé court de l'état général.
-- Question hors capteurs (météo, calcul, etc.) → Réponds normalement.
-
-Informations disponibles :
-- Heure actuelle         : {heure_actuelle}
-- Date actuelle          : {date_actuelle}
-- Capteurs défaillants   : {defaillants_str}
-- Température ambiante   : {capteurs.get('temp_amb', 'N/A')}°C
-- Température corporelle : {capteurs.get('temp_corps', 'N/A')}°C
-- Humidité               : {capteurs.get('humidity', 'N/A')}%
-- Niveau de gaz          : {capteurs.get('gaz', 'N/A')} (seuil danger : 1500)
-- Fréquence cardiaque    : {capteurs.get('bpm', 'N/A')} BPM
-- Accélération totale    : {capteurs.get('total_g', 'N/A')}g
-- Distance objet         : {capteurs.get('distance', 'N/A')} cm
-- GPS fixé               : {capteurs.get('gps_fix', False)}
-- Statut général         : {capteurs.get('analyse', {}).get('niveau', 'N/A')}"""
-
-    try:
-        reponse = client.messages.create(
-            model="claude-sonnet-4-5",
-            max_tokens=150,
-            system=prompt_systeme,
-            messages=[{"role": "user", "content": question}]
-        )
-        texte = reponse.content[0].text
-    except Exception as e:
-        texte = "Je rencontre une difficulté technique. Veuillez réessayer." \
-                if langue == "fr" else "Technical error. Please try again."
-
-    return jsonify({"reponse": texte})
-
-# ── ROUTE 3 — /vocal-audio ────────────────────────────────────
-# Reçoit fichier audio, transcrit avec Whisper, répond avec Claude
-@app.route("/vocal-audio", methods=["POST"])
-def vocal_audio():
-    fichier       = request.files.get("audio")
-    langue        = request.form.get("langue", "fr")
-    capteurs_str  = request.form.get("capteurs", "{}")
-    defaillants_str = request.form.get("capteurs_defaillants", "[]")
-
-    try:
-        capteurs_data    = json.loads(capteurs_str)
-        capteurs_defaillants = json.loads(defaillants_str)
-    except:
-        capteurs_data    = {}
-        capteurs_defaillants = []
-
-    question = ""
-
-    # Transcription audio avec Whisper si disponible
-    if fichier and openai_client:
-        try:
-            with tempfile.NamedTemporaryFile(suffix=".m4a", delete=False) as tmp:
-                fichier.save(tmp.name)
-                tmp_path = tmp.name
-            with open(tmp_path, "rb") as f:
-                resultat = openai_client.audio.transcriptions.create(
-                    model="whisper-1",
-                    file=f,
-                    language="fr" if langue == "fr" else "en"
-                )
-            os.unlink(tmp_path)
-            question = resultat.text.strip()
-            print(f"Transcription Whisper : {question}")
-        except Exception as e:
-            print(f"Erreur Whisper : {e}")
-            question = ""
-
-    # Fallback si pas de transcription
-    if not question:
-        question = "Donne-moi un résumé de mon état de santé actuel." \
-                   if langue == "fr" else \
-                   "Give me a summary of my current health status."
-
-    # Appel Claude pour la réponse
-    heure_actuelle = datetime.now().strftime("%H:%M")
-    date_actuelle  = datetime.now().strftime("%d/%m/%Y")
-    langue_forcee  = "Réponds OBLIGATOIREMENT en français." if langue == "fr" \
-                     else "Reply ONLY in English."
-    defaillants_info = ", ".join(capteurs_defaillants) if capteurs_defaillants else "aucun"
-
-    prompt_systeme = f"""Tu es SENTINELLE, assistant vocal de sécurité industrielle.
-
-RÈGLE ABSOLUE N°1 : Réponds D'ABORD DIRECTEMENT à la question posée.
-RÈGLE ABSOLUE N°2 : Seulement APRÈS avoir répondu, tu peux ajouter UNE information complémentaire utile.
-RÈGLE ABSOLUE N°3 : Maximum 2 phrases au total.
-RÈGLE ABSOLUE N°4 : {langue_forcee}
-RÈGLE ABSOLUE N°5 : Pas de markdown, langage naturel parlé uniquement.
-
-Informations disponibles :
-- Heure : {heure_actuelle} | Date : {date_actuelle}
-- Capteurs défaillants : {defaillants_info}
-- Température ambiante   : {capteurs_data.get('temp_amb', 'N/A')}°C
-- Température corporelle : {capteurs_data.get('temp_corps', 'N/A')}°C
-- Humidité               : {capteurs_data.get('humidity', 'N/A')}%
-- Gaz                    : {capteurs_data.get('gaz', 'N/A')} (seuil : 1500)
-- BPM                    : {capteurs_data.get('bpm', 'N/A')}
-- Accélération           : {capteurs_data.get('total_g', 'N/A')}g
-- Distance               : {capteurs_data.get('distance', 'N/A')} cm
-- Statut général         : {capteurs_data.get('analyse', {}).get('niveau', 'N/A')}"""
-
-    try:
-        rep = client.messages.create(
-            model="claude-sonnet-4-5",
-            max_tokens=150,
-            system=prompt_systeme,
-            messages=[{"role": "user", "content": question}]
-        )
-        reponse = rep.content[0].text
-    except Exception as e:
-        reponse = "Erreur d'analyse." if langue == "fr" else "Analysis error."
-
-    return jsonify({"question": question, "reponse": reponse})
-
-# ── ROUTE 4 — /detecter-wakeword ─────────────────────────────
-# Détecte si le mot "Sentinelle" a été prononcé dans l'audio
-@app.route("/detecter-wakeword", methods=["POST"])
-def detecter_wakeword():
-    fichier = request.files.get("audio")
-    langue  = request.form.get("langue", "fr")
-
-    if not fichier:
-        return jsonify({"detected": False})
-
-    # Si Whisper disponible → transcription réelle
-    if openai_client:
-        try:
-            with tempfile.NamedTemporaryFile(suffix=".m4a", delete=False) as tmp:
-                fichier.save(tmp.name)
-                tmp_path = tmp.name
-            with open(tmp_path, "rb") as f:
-                resultat = openai_client.audio.transcriptions.create(
-                    model="whisper-1",
-                    file=f,
-                    language="fr" if langue == "fr" else "en"
-                )
-            os.unlink(tmp_path)
-            texte = resultat.text.lower().strip()
-            print(f"Wake word check : '{texte}'")
-
-            wake_words = ["sentinelle", "sentinel", "centinelle", "santinelle",
-                          "sentinal", "sentinell"]
-            detected = any(w in texte for w in wake_words)
-            return jsonify({"detected": detected, "texte": texte})
-
-        except Exception as e:
-            print(f"Erreur wake word : {e}")
-            return jsonify({"detected": False})
-
-    # Sans Whisper → wake word désactivé
-    return jsonify({"detected": False, "raison": "Whisper non configuré"})
-
-# ── ROUTE 5 — /dernieres-donnees ──────────────────────────────
-# Renvoie le dernier JSON reçu de l'ESP-32
-@app.route("/dernieres-donnees", methods=["GET"])
-def dernieres_donnees():
-    return jsonify(derniere_donnee if derniere_donnee else {})
-
-# ── ROUTE 6 — /test-vocal ─────────────────────────────────────
-# Page de diagnostic vocal dans le navigateur
-@app.route("/test-vocal")
-def test_vocal():
-    return """<!DOCTYPE html>
-<html><head><meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<style>
-body{background:#000;color:#fff;font-family:monospace;padding:20px;}
-button{background:#238636;color:#fff;border:none;padding:15px 30px;
-font-size:1.2em;border-radius:8px;margin:10px 0;cursor:pointer;}
-#log{background:#111;padding:10px;border-radius:5px;margin-top:10px;
-min-height:100px;white-space:pre-wrap;font-size:0.9em;}
-</style></head>
-<body>
-<h2>🎤 Test Reconnaissance Vocale</h2>
-<button onclick="tester()">Appuyer et parler</button>
-<div id="log">En attente...</div>
-<script>
-function log(msg){document.getElementById('log').textContent+=msg+'\\n';}
-function tester(){
-  log('Démarrage...');
-  const SR=window.SpeechRecognition||window.webkitSpeechRecognition;
-  if(!SR){log('ERREUR: non disponible');return;}
-  const r=new SR();
-  r.lang='fr-FR';
-  r.interimResults=true;
-  r.continuous=true;
-  r.onstart=()=>log('✅ Micro activé — parlez !');
-  r.onresult=(e)=>{
-    const t=e.results[e.results.length-1][0].transcript;
-    log('📝 : '+t);
-  };
-  r.onerror=(e)=>log('❌ Erreur: '+e.error);
-  r.onend=()=>log('⏹️ Fin écoute');
-  r.start();
-}
-</script>
-</body></html>"""
-
-# ── ROUTE 7 — /dashboard ──────────────────────────────────────
-DASHBOARD_HTML = """<!DOCTYPE html>
-<html lang="fr">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta http-equiv="refresh" content="3">
-  <title>SENTINELLE-IA</title>
-  <style>
-    *{box-sizing:border-box;margin:0;padding:0;}
-    body{font-family:'Courier New',monospace;background:#0d1117;color:#c9d1d9;padding:20px;min-height:100vh;}
-    h1{color:#58a6ff;margin-bottom:20px;font-size:1.4em;}
-    .statut{padding:15px 20px;border-radius:8px;margin-bottom:20px;font-size:1.1em;font-weight:bold;}
-    .statut.danger{background:#2d1b1b;border:2px solid #f85149;color:#f85149;}
-    .statut.warning{background:#2d2208;border:2px solid #e3b341;color:#e3b341;}
-    .statut.ok{background:#1b2d1b;border:2px solid #3fb950;color:#3fb950;}
-    .grille{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin-bottom:20px;}
-    .carte{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:15px;text-align:center;}
-    .carte .val{font-size:1.6em;font-weight:bold;color:#58a6ff;}
-    .carte .nom{font-size:0.8em;color:#8b949e;margin-top:5px;}
-    .carte.danger{border-color:#f85149;background:#2d1b1b;}
-    .carte.danger .val{color:#f85149;}
-    #vocal-section{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:20px;text-align:center;margin-bottom:20px;}
-    #btn-parler{background:#238636;color:white;border:none;border-radius:50%;width:80px;height:80px;font-size:2em;cursor:pointer;margin:15px 0;transition:background 0.2s;}
-    #btn-parler.ecoute{background:#f85149;animation:pulse 1s infinite;}
-    @keyframes pulse{0%{box-shadow:0 0 0 0 rgba(248,81,73,0.5);}100%{box-shadow:0 0 0 15px rgba(248,81,73,0);}}
-    #transcription{color:#8b949e;font-style:italic;margin:8px 0;min-height:24px;}
-    #reponse-ia{color:#58a6ff;font-size:1.05em;margin:8px 0;min-height:24px;}
-    .timestamp{color:#444;font-size:0.8em;margin-top:10px;}
-    a{color:#58a6ff;}
-  </style>
-</head>
-<body>
-  <h1>🛡️ SENTINELLE-IA — Surveillance temps réel</h1>
-  {% if data %}
-  <div class="statut {{ niveau_class }}">
-    {% if data.analyse %}
-      {{ '🚨' if data.analyse.niveau == 'DANGER' else ('⚠️' if data.analyse.niveau == 'ATTENTION' else '✅') }}
-      {{ data.analyse.niveau }} — {{ data.analyse.message }}
-    {% else %}✅ En attente d'analyse...{% endif %}
-  </div>
-  <div class="grille">
-    <div class="carte {{ 'danger' if data.temp_amb > 45 else '' }}">
-      <div class="val">{{ data.temp_amb }}°C</div><div class="nom">🌡 Temp. ambiante</div>
-    </div>
-    <div class="carte {{ 'danger' if data.temp_corps > 38.5 else '' }}">
-      <div class="val">{{ data.temp_corps }}°C</div><div class="nom">🤒 Temp. corporelle</div>
-    </div>
-    <div class="carte">
-      <div class="val">{{ data.humidity }}%</div><div class="nom">💧 Humidité</div>
-    </div>
-    <div class="carte {{ 'danger' if data.gaz > 1500 else '' }}">
-      <div class="val">{{ data.gaz }}</div><div class="nom">💨 Gaz (brut)</div>
-    </div>
-    <div class="carte {{ 'danger' if data.bpm > 120 or data.bpm < 40 else '' }}">
-      <div class="val">{{ data.bpm }}</div><div class="nom">💓 BPM</div>
-    </div>
-    <div class="carte {{ 'danger' if data.total_g > 2.5 else '' }}">
-      <div class="val">{{ data.total_g }}g</div><div class="nom">⚡ Accélération</div>
-    </div>
-    <div class="carte">
-      <div class="val">{{ data.distance }} cm</div><div class="nom">📡 Distance</div>
-    </div>
-    <div class="carte">
-      {% if data.gps_fix %}
-        <div class="val">📍</div>
-        <div class="nom"><a href="https://maps.google.com/?q={{ data.lat }},{{ data.lng }}" target="_blank">Voir sur Maps</a></div>
-      {% else %}<div class="val">—</div><div class="nom">GPS non fixé</div>{% endif %}
-    </div>
-  </div>
-  {% else %}
-  <div class="statut ok">En attente des données de l'ESP-32...</div>
-  {% endif %}
-
-  <div id="vocal-section">
-    <h2 style="color:#c9d1d9;margin-bottom:8px;">🎙️ Parler à SENTINELLE</h2>
-    <p style="color:#8b949e;font-size:0.9em">Appuyez sur le bouton et posez votre question</p>
-    <button id="btn-parler" onclick="basculerEcoute()">🎤</button>
-    <p id="transcription">En attente...</p>
-    <p id="reponse-ia"></p>
-  </div>
-
-  {% if data %}<p class="timestamp">Mise à jour toutes les 3s • {{ data.timestamp }}</p>{% endif %}
-
-<script>
-const CAPTEURS = {
-  temp_amb:   {{ data.temp_amb   if data else 0 }},
-  temp_corps: {{ data.temp_corps if data else 0 }},
-  humidity:   {{ data.humidity   if data else 0 }},
-  gaz:        {{ data.gaz        if data else 0 }},
-  bpm:        {{ data.bpm        if data else 0 }},
-  total_g:    {{ data.total_g    if data else 0 }},
-  distance:   {{ data.distance   if data else 0 }},
-  gps_fix:    {{ 'true' if data and data.gps_fix else 'false' }}
+// ── Thèmes ────────────────────────────────────────────────────
+const THEMES = {
+  nuit: {
+    fond: "#0d1117", fondCarte: "#161b22", fondReponse: "#0d1117",
+    bordure: "#30363d", texte: "#c9d1d9", texteFaible: "#8b949e",
+    accent: "#58a6ff", statusBar: "light-content",
+    iconeTheme: "☀️", labelTheme: "Jour",
+  },
+  jour: {
+    fond: "#f0f2f5", fondCarte: "#ffffff", fondReponse: "#f8f9fa",
+    bordure: "#d0d7de", texte: "#1c2128", texteFaible: "#57606a",
+    accent: "#0969da", statusBar: "dark-content",
+    iconeTheme: "🌙", labelTheme: "Nuit",
+  },
 };
 
-let recognition = null;
-let enEcoute    = false;
-let silenceTimer = null;
+// ── Textes bilingues ──────────────────────────────────────────
+const T = {
+  fr: {
+    titre: "SENTINELLE-IA", sousTitre: "Surveillance industrielle intelligente",
+    connexion: "⏳ Connexion...", espEsp: "⏳ En attente ESP-32...",
+    surveillance: "✅ Surveillance active", danger: "🚨 DANGER DÉTECTÉ",
+    attention: "⚠️ ATTENTION REQUISE", erreur: "⚠️ Erreur connexion",
+    capteurDef: "⚠️ Capteur(s) défaillant(s)",
+    wakeWord: "👂 Dites 'Sentinelle' ou appuyez 🎤",
+    ecoute: "🔴 Enregistrement en cours...",
+    analyse: "⏳ Analyse...", reflechit: "⏳ SENTINELLE réfléchit...",
+    rien: "Rien capté — réessayez", erreurCo: "Erreur de connexion.",
+    vous: "Vous", sentinelle: "SENTINELLE :",
+    maj: "Mise à jour toutes les 3s",
+    titreVocal: "🎙️ Parler à SENTINELLE",
+    capteurs: "📡 Données capteurs",
+    parler: "Appuyer pour parler",
+    arreter: "Appuyer pour envoyer",
+    modeTexte: "⌨️ Écrire une question",
+    envoyer: "Envoyer",
+    ouEcrire: "Écrivez votre question...",
+  },
+  en: {
+    titre: "SENTINEL-AI", sousTitre: "Industrial safety monitoring",
+    connexion: "⏳ Connecting...", espEsp: "⏳ Waiting for ESP-32...",
+    surveillance: "✅ Active monitoring", danger: "🚨 DANGER DETECTED",
+    attention: "⚠️ ATTENTION REQUIRED", erreur: "⚠️ Connection error",
+    capteurDef: "⚠️ Sensor(s) failing",
+    wakeWord: "👂 Say 'Sentinel' or press 🎤",
+    ecoute: "🔴 Recording...",
+    analyse: "⏳ Analyzing...", reflechit: "⏳ SENTINEL is thinking...",
+    rien: "Nothing captured — try again", erreurCo: "Connection error.",
+    vous: "You", sentinelle: "SENTINEL:",
+    maj: "Updated every 3s",
+    titreVocal: "🎙️ Talk to SENTINEL",
+    capteurs: "📡 Sensor data",
+    parler: "Press to speak",
+    arreter: "Press to send",
+    modeTexte: "⌨️ Type a question",
+    envoyer: "Send",
+    ouEcrire: "Type your question...",
+  },
+};
 
-function demarrerReconnaissance() {
-  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-  if (!SR) {
-    document.getElementById('transcription').textContent = "Utilisez Chrome";
-    return;
+export default function App() {
+  const [theme, setTheme]               = useState("nuit");
+  const [langue, setLangue]             = useState("fr");
+  const [statut, setStatut]             = useState("⏳ Connexion...");
+  const [couleurStatut, setCouleurStatut] = useState("#8b949e");
+  const [capteurs, setCapteurs]         = useState(null);
+  const [capteursDefaillants, setCapteursDefaillants] = useState([]);
+  const [transcription, setTranscription] = useState("");
+  const [reponse, setReponse]           = useState("");
+  const [modeEcoute, setModeEcoute]     = useState("veille");
+  const [dernierNiveau, setDernierNiveau] = useState("OK");
+  const [modeTexte, setModeTexte]       = useState(false);
+  const [questionTexte, setQuestionTexte] = useState("");
+  const [wakeWordEcoute, setWakeWordEcoute] = useState(false);
+
+  const intervalCapteursRef = useRef(null);
+  const intervalWakeWordRef = useRef(null);
+  const derniereAlerteRef   = useRef(0);
+  const langueRef           = useRef("fr");
+  const recordingRef        = useRef(null);
+  const enregistrementRef   = useRef(false);
+  const timerEnreg          = useRef(null);
+  const wakeCheckRef        = useRef(false);
+
+  const th = THEMES[theme];
+  const t  = T[langue];
+
+  useEffect(() => { langueRef.current = langue; }, [langue]);
+
+  useEffect(() => {
+    configurerAudio();
+    demarrerSurveillance();
+    demarrerEcouteWakeWord();
+    return () => {
+      if (intervalCapteursRef.current) clearInterval(intervalCapteursRef.current);
+      if (intervalWakeWordRef.current) clearInterval(intervalWakeWordRef.current);
+      if (timerEnreg.current) clearTimeout(timerEnreg.current);
+    };
+  }, []);
+
+  // ── Audio ─────────────────────────────────────────────────────
+  async function configurerAudio() {
+    try {
+      await Audio.requestPermissionsAsync();
+      await Audio.setAudioModeAsync({
+        allowsRecordingIOS: true,
+        playsInSilentModeIOS: true,
+      });
+    } catch (e) {}
   }
-  recognition = new SR();
-  recognition.lang            = 'fr-FR';
-  recognition.interimResults  = true;
-  recognition.continuous      = true;
-  recognition.maxAlternatives = 1;
 
-  recognition.onstart = () => {
-    document.getElementById('transcription').textContent = "Je vous écoute...";
-    document.getElementById('btn-parler').classList.add('ecoute');
-    document.getElementById('reponse-ia').textContent = "";
-  };
+  // ── Détection capteurs défaillants ────────────────────────────
+  function detecterDefaillants(data) {
+    const def = [];
+    if (!data.temp_amb || data.temp_amb === 0) def.push("DHT22");
+    if (!data.temp_corps || data.temp_corps < 10) def.push("DS18B20");
+    if (data.gaz === null || data.gaz === undefined) def.push("MQ-2");
+    if (!data.total_g && data.total_g !== 0) def.push("MPU6050");
+    if (!data.distance) def.push("HC-SR04");
+    return def;
+  }
 
-  recognition.onresult = async (event) => {
-    if (silenceTimer) clearTimeout(silenceTimer);
-    const dernier  = event.results[event.results.length - 1];
-    const question = dernier[0].transcript;
-    document.getElementById('transcription').textContent = '"' + question + '"';
-    silenceTimer = setTimeout(async () => {
-      if (question.trim().length > 0) {
-        document.getElementById('reponse-ia').textContent = "⏳ SENTINELLE réfléchit...";
-        document.getElementById('btn-parler').classList.remove('ecoute');
-        enEcoute = false;
-        recognition.stop();
-        await interrogerSentinelle(question);
+  // ── Surveillance capteurs toutes les 3s ───────────────────────
+  function demarrerSurveillance() {
+    verifierCapteurs();
+    intervalCapteursRef.current = setInterval(verifierCapteurs, INTERVALLE_CAPTEURS);
+  }
+
+  async function verifierCapteurs() {
+    const lng = langueRef.current;
+    const txt = T[lng];
+    try {
+      const res = await fetch(`${API_URL}/dernieres-donnees`, {
+        signal: AbortSignal.timeout(4000)
+      });
+      if (!res.ok) { setStatut(txt.erreur); setCouleurStatut("#e3b341"); return; }
+      const data = await res.json();
+      if (!data || Object.keys(data).length === 0) {
+        setStatut(txt.espEsp); setCouleurStatut("#8b949e"); return;
       }
-    }, 1500);
-  };
 
-  recognition.onerror = (e) => {
-    if (e.error === 'no-speech') {
-      recognition.stop();
-      if (enEcoute) recognition.start();
-      return;
+      setCapteurs(data);
+      const def = detecterDefaillants(data);
+      setCapteursDefaillants(def);
+
+      const niveau = data.analyse?.niveau || "OK";
+      if (niveau === "DANGER") {
+        setStatut(txt.danger); setCouleurStatut("#f85149");
+        Vibration.vibrate([500, 200, 500, 200, 500]);
+      } else if (niveau === "ATTENTION") {
+        setStatut(txt.attention); setCouleurStatut("#e3b341");
+        Vibration.vibrate(300);
+      } else if (def.length > 0) {
+        setStatut(`${txt.capteurDef} : ${def.join(", ")}`);
+        setCouleurStatut("#e3b341");
+      } else {
+        setStatut(txt.surveillance); setCouleurStatut("#3fb950");
+      }
+
+      const maintenant = Date.now();
+      if (
+        (niveau === "DANGER" || niveau === "ATTENTION") &&
+        niveau !== dernierNiveau &&
+        maintenant - derniereAlerteRef.current > 30000
+      ) {
+        derniereAlerteRef.current = maintenant;
+        setDernierNiveau(niveau);
+        await alerteVocaleAuto(data, lng);
+      } else if (niveau === "OK") {
+        setDernierNiveau("OK");
+      }
+    } catch (e) {
+      setStatut(T[langueRef.current].erreur);
+      setCouleurStatut("#e3b341");
     }
-    document.getElementById('transcription').textContent = "Erreur : " + e.error;
-    document.getElementById('btn-parler').classList.remove('ecoute');
-    enEcoute = false;
-  };
-
-  recognition.onend = () => {
-    if (enEcoute) {
-      try { recognition.start(); } catch(e) {}
-    } else {
-      document.getElementById('btn-parler').classList.remove('ecoute');
-    }
-  };
-
-  recognition.start();
-  enEcoute = true;
-}
-
-function basculerEcoute() {
-  if (enEcoute) {
-    enEcoute = false;
-    if (silenceTimer) clearTimeout(silenceTimer);
-    if (recognition) recognition.stop();
-    document.getElementById('transcription').textContent = "En attente...";
-    document.getElementById('btn-parler').classList.remove('ecoute');
-  } else {
-    demarrerReconnaissance();
   }
-}
 
-async function interrogerSentinelle(question) {
-  try {
-    const res = await fetch('/vocal', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ question, capteurs: CAPTEURS, langue: 'fr' })
+  // ── Alerte vocale automatique ─────────────────────────────────
+  async function alerteVocaleAuto(data, lng) {
+    const question = lng === "fr"
+      ? `ALERTE ${data.analyse?.niveau} : ${data.analyse?.message}. Donne une instruction d'urgence courte en français.`
+      : `ALERT ${data.analyse?.niveau}: ${data.analyse?.message}. Give a short emergency instruction in English.`;
+    await envoyerQuestion(question, lng);
+  }
+
+  // ── Wake word — écoute passive toutes les 3s ──────────────────
+  function demarrerEcouteWakeWord() {
+    setWakeWordEcoute(true);
+    intervalWakeWordRef.current = setInterval(async () => {
+      if (enregistrementRef.current || wakeCheckRef.current) return;
+      await verifierWakeWord();
+    }, 3000);
+  }
+
+  async function verifierWakeWord() {
+    wakeCheckRef.current = true;
+    try {
+      const { recording } = await Audio.Recording.createAsync(
+        Audio.RecordingOptionsPresets.HIGH_QUALITY
+      );
+      await new Promise(r => setTimeout(r, 2500));
+      await recording.stopAndUnloadAsync();
+      const uri = recording.getURI();
+
+      const formData = new FormData();
+      formData.append("audio", { uri, type: "audio/m4a", name: "wake.m4a" });
+      formData.append("langue", langueRef.current);
+
+      const res = await fetch(`${API_URL}/detecter-wakeword`, {
+        method: "POST",
+        body: formData,
+        signal: AbortSignal.timeout(5000),
+      });
+
+      if (res.ok) {
+        const data = await res.json();
+        if (data.detected && !enregistrementRef.current) {
+          await activerEnregistrement();
+        }
+      }
+    } catch (e) {}
+    wakeCheckRef.current = false;
+  }
+
+  // ── Activation enregistrement ─────────────────────────────────
+  async function activerEnregistrement() {
+    if (enregistrementRef.current) return;
+    enregistrementRef.current = true;
+    const lng = langueRef.current;
+    setModeEcoute("enregistrement");
+    setTranscription(T[lng].ecoute);
+    setReponse("");
+
+    Speech.speak(lng === "fr" ? "Oui ?" : "Yes?", {
+      language: lng === "fr" ? "fr-FR" : "en-US",
+      rate: 1.3,
     });
-    const json    = await res.json();
-    const reponse = json.reponse;
-    document.getElementById('reponse-ia').textContent = reponse;
-    lireAVoixHaute(reponse);
-  } catch (err) {
-    document.getElementById('reponse-ia').textContent = "Erreur de connexion.";
+
+    try {
+      const { recording } = await Audio.Recording.createAsync(
+        Audio.RecordingOptionsPresets.HIGH_QUALITY
+      );
+      recordingRef.current = recording;
+      timerEnreg.current = setTimeout(traiterEnregistrement, DUREE_ENREGISTREMENT);
+    } catch (e) {
+      enregistrementRef.current = false;
+      setModeEcoute("veille");
+    }
   }
+
+  // ── Bouton micro ──────────────────────────────────────────────
+  function gererBoutonMicro() {
+    if (modeEcoute === "traitement") return;
+    if (modeEcoute === "enregistrement") {
+      if (timerEnreg.current) clearTimeout(timerEnreg.current);
+      traiterEnregistrement();
+    } else {
+      activerEnregistrement();
+    }
+  }
+
+  // ── Traitement enregistrement ─────────────────────────────────
+  async function traiterEnregistrement() {
+    if (!recordingRef.current) return;
+    const lng = langueRef.current;
+
+    try {
+      setModeEcoute("traitement");
+      setTranscription(T[lng].analyse);
+
+      await recordingRef.current.stopAndUnloadAsync();
+      const uri = recordingRef.current.getURI();
+      recordingRef.current = null;
+      enregistrementRef.current = false;
+
+      // Envoie à /vocal-audio
+      const formData = new FormData();
+      formData.append("audio", { uri, type: "audio/m4a", name: "question.m4a" });
+      formData.append("langue", lng);
+      formData.append("capteurs", JSON.stringify(capteurs || {}));
+      formData.append("capteurs_defaillants", JSON.stringify(capteursDefaillants));
+
+      const res = await fetch(`${API_URL}/vocal-audio`, {
+        method: "POST",
+        body: formData,
+        signal: AbortSignal.timeout(15000),
+      });
+
+      if (res.ok) {
+        const data = await res.json();
+        // Sans Whisper — affiche indication audio reçu
+        setTranscription(`${T[lng].vous} : 🎤 (audio reçu)`);
+        const texteReponse = data.reponse || T[lng].erreurCo;
+        setReponse(texteReponse);
+        lireReponse(texteReponse, lng);
+      } else {
+        setTranscription(T[lng].rien);
+      }
+    } catch (e) {
+      setTranscription(T[lng].erreurCo);
+      enregistrementRef.current = false;
+    }
+    setModeEcoute("veille");
+  }
+
+  // ── Question texte ────────────────────────────────────────────
+  async function envoyerQuestionTexte() {
+    if (!questionTexte.trim()) return;
+    const lng = langue;
+    const q   = questionTexte.trim();
+    setTranscription(`${T[lng].vous} : "${q}"`);
+    setQuestionTexte("");
+    setModeEcoute("traitement");
+    await envoyerQuestion(q, lng);
+    setModeEcoute("veille");
+  }
+
+  // ── Envoi question à Claude ───────────────────────────────────
+  async function envoyerQuestion(question, lng) {
+    const txt = T[lng];
+    try {
+      setReponse(txt.reflechit);
+      const res = await fetch(`${API_URL}/vocal`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          question,
+          capteurs: capteurs || {},
+          langue: lng,
+          capteurs_defaillants: capteursDefaillants,
+        }),
+        signal: AbortSignal.timeout(10000),
+      });
+      const data  = await res.json();
+      const texte = data.reponse || txt.erreurCo;
+      setReponse(texte);
+      lireReponse(texte, lng);
+    } catch (e) {
+      setReponse(T[lng].erreurCo);
+    }
+    setModeEcoute("veille");
+  }
+
+  // ── Synthèse vocale ───────────────────────────────────────────
+  function lireReponse(texte, lng) {
+    Speech.stop();
+    const opts = lng === "fr"
+      ? ["fr-FR", "fr-fr", "fr"]
+      : ["en-US", "en-us", "en"];
+    const parler = (i) => {
+      if (i >= opts.length) return;
+      Speech.speak(texte, {
+        language: opts[i], pitch: 1.0, rate: 0.9,
+        onError: () => parler(i + 1),
+      });
+    };
+    parler(0);
+  }
+
+  // ── Helpers bouton ────────────────────────────────────────────
+  const couleurBouton = () => {
+    if (modeEcoute === "enregistrement") return "#f85149";
+    if (modeEcoute === "traitement") return "#e3b341";
+    return "#238636";
+  };
+  const iconeBouton = () => {
+    if (modeEcoute === "enregistrement") return "⏹️";
+    if (modeEcoute === "traitement") return "⏳";
+    return "🎤";
+  };
+  const texteBouton = () => {
+    if (modeEcoute === "enregistrement") return t.arreter;
+    if (modeEcoute === "traitement") return t.analyse;
+    return t.parler;
+  };
+
+  // ── Rendu ─────────────────────────────────────────────────────
+  return (
+    <View style={{ flex: 1, backgroundColor: th.fond }}>
+      <StatusBar barStyle={th.statusBar} backgroundColor={th.fond} />
+      <ScrollView style={{ flex: 1 }}
+        contentContainerStyle={[styles.content, { backgroundColor: th.fond }]}>
+
+        {/* En-tête */}
+        <View style={styles.entete}>
+          <View>
+            <Text style={[styles.titre, { color: th.accent }]}>🛡️ {t.titre}</Text>
+            <Text style={[styles.sousTitre, { color: th.texteFaible }]}>{t.sousTitre}</Text>
+          </View>
+          <View style={styles.controles}>
+            <View style={styles.switchGroupe}>
+              <Text style={[styles.switchLabel, langue === "fr" && { color: th.accent }]}>FR</Text>
+              <Switch
+                value={langue === "en"}
+                onValueChange={(v) => setLangue(v ? "en" : "fr")}
+                trackColor={{ false: "#238636", true: "#1f6feb" }}
+                thumbColor="#fff"
+                style={styles.switchPetit}
+              />
+              <Text style={[styles.switchLabel, langue === "en" && { color: th.accent }]}>EN</Text>
+            </View>
+            <TouchableOpacity
+              style={[styles.boutonTheme, { backgroundColor: th.fondCarte, borderColor: th.bordure }]}
+              onPress={() => setTheme(theme === "nuit" ? "jour" : "nuit")}
+            >
+              <Text>{th.iconeTheme}</Text>
+              <Text style={[styles.labelTheme, { color: th.texteFaible }]}>{th.labelTheme}</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+
+        {/* Statut */}
+        <View style={[styles.carteStatut, { backgroundColor: th.fondCarte, borderColor: couleurStatut }]}>
+          <Text style={[styles.texteStatut, { color: couleurStatut }]}>{statut}</Text>
+          {capteurs?.analyse?.message && (
+            <Text style={[styles.messageAnalyse, { color: th.texte }]}>
+              {capteurs.analyse.message}
+            </Text>
+          )}
+        </View>
+
+        {/* Capteurs */}
+        <Text style={[styles.titreSectionPlat, { color: th.texteFaible }]}>{t.capteurs}</Text>
+        <View style={styles.grille}>
+          <CarteCapteur th={th} label="🌡 Temp. amb."
+            valeur={capteurs ? `${capteurs.temp_amb}°C` : "--"}
+            danger={capteurs?.temp_amb > 45}
+            defaillant={capteursDefaillants.includes("DHT22")} />
+          <CarteCapteur th={th} label="🤒 Temp. corps"
+            valeur={capteurs ? `${capteurs.temp_corps}°C` : "--"}
+            danger={capteurs?.temp_corps > 38.5}
+            defaillant={capteursDefaillants.includes("DS18B20")} />
+          <CarteCapteur th={th} label="💧 Humidité"
+            valeur={capteurs ? `${capteurs.humidity}%` : "--"}
+            danger={false} defaillant={false} />
+          <CarteCapteur th={th} label="💨 Gaz"
+            valeur={capteurs ? `${capteurs.gaz}` : "--"}
+            danger={capteurs?.gaz > 1500}
+            defaillant={capteursDefaillants.includes("MQ-2")} />
+          <CarteCapteur th={th} label="💓 BPM"
+            valeur={capteurs ? `${capteurs.bpm}` : "--"}
+            danger={capteurs?.bpm > 120 || capteurs?.bpm < 40}
+            defaillant={capteursDefaillants.includes("MAX30102")} />
+          <CarteCapteur th={th} label="⚡ Accél."
+            valeur={capteurs ? `${capteurs.total_g}g` : "--"}
+            danger={capteurs?.total_g > 2.5}
+            defaillant={capteursDefaillants.includes("MPU6050")} />
+          <CarteCapteur th={th} label="📡 Distance"
+            valeur={capteurs ? `${capteurs.distance} cm` : "--"}
+            danger={false}
+            defaillant={capteursDefaillants.includes("HC-SR04")} />
+          <CarteCapteur th={th} label="📍 GPS"
+            valeur={capteurs ? (capteurs.gps_fix ? "✓ Fixé" : "Non fixé") : "--"}
+            danger={false} defaillant={false} />
+        </View>
+
+        {/* Zone vocale */}
+        <View style={[styles.carteVocale, { backgroundColor: th.fondCarte, borderColor: th.bordure }]}>
+          <Text style={[styles.titreSection, { color: th.texte }]}>{t.titreVocal}</Text>
+
+          {/* Indicateur état */}
+          <View style={[styles.indicateurEtat, { borderColor: couleurBouton() }]}>
+            <Text style={[styles.texteEtat, { color: couleurBouton() }]}>
+              {modeEcoute === "veille" ? t.wakeWord :
+               modeEcoute === "enregistrement" ? t.ecoute :
+               t.analyse}
+            </Text>
+          </View>
+
+          {/* Bouton micro */}
+          <TouchableOpacity
+            style={[styles.boutonMicro, { backgroundColor: couleurBouton() }]}
+            onPress={gererBoutonMicro}
+            disabled={modeEcoute === "traitement"}
+            activeOpacity={0.75}
+          >
+            <Text style={styles.iconeMicro}>{iconeBouton()}</Text>
+            <Text style={styles.texteBouton}>{texteBouton()}</Text>
+          </TouchableOpacity>
+
+          {/* Bouton mode texte */}
+          <TouchableOpacity
+            style={[styles.boutonModeTexte, { borderColor: th.bordure }]}
+            onPress={() => setModeTexte(!modeTexte)}
+          >
+            <Text style={[styles.texteModeTexte, { color: th.texteFaible }]}>
+              {modeTexte ? "🎤 Mode vocal" : t.modeTexte}
+            </Text>
+          </TouchableOpacity>
+
+          {/* Champ texte */}
+          {modeTexte && (
+            <View style={styles.zoneTexte}>
+              <TextInput
+                style={[styles.champTexte, {
+                  backgroundColor: th.fondReponse,
+                  borderColor: th.bordure,
+                  color: th.texte,
+                }]}
+                placeholder={t.ouEcrire}
+                placeholderTextColor={th.texteFaible}
+                value={questionTexte}
+                onChangeText={setQuestionTexte}
+                onSubmitEditing={envoyerQuestionTexte}
+                returnKeyType="send"
+              />
+              <TouchableOpacity style={styles.boutonEnvoyer} onPress={envoyerQuestionTexte}>
+                <Text style={styles.texteEnvoyer}>{t.envoyer}</Text>
+              </TouchableOpacity>
+            </View>
+          )}
+
+          {/* Transcription */}
+          {transcription !== "" && (
+            <View style={[styles.carteTranscription, {
+              backgroundColor: th.fondReponse, borderColor: th.bordure
+            }]}>
+              <Text style={[styles.texteTranscription, { color: th.texteFaible }]}>
+                {transcription}
+              </Text>
+            </View>
+          )}
+
+          {/* Réponse */}
+          {reponse !== "" && (
+            <View style={[styles.carteReponse, {
+              backgroundColor: th.fondReponse, borderColor: th.accent
+            }]}>
+              <Text style={[styles.labelReponse, { color: th.accent }]}>{t.sentinelle}</Text>
+              <Text style={[styles.texteReponse, { color: th.texte }]}>{reponse}</Text>
+            </View>
+          )}
+        </View>
+
+        <Text style={[styles.footer, { color: th.texteFaible }]}>
+          {t.maj} • {capteurs?.timestamp || "--:--:--"}
+        </Text>
+      </ScrollView>
+    </View>
+  );
 }
 
-function lireAVoixHaute(texte) {
-  const synth = window.speechSynthesis;
-  synth.cancel();
-  function parler(voix) {
-    const u = new SpeechSynthesisUtterance(texte);
-    u.lang = 'fr-FR'; u.rate = 0.92; u.pitch = 1.0; u.volume = 1.0;
-    const voixFR = voix.find(v => v.lang === 'fr-FR' && v.localService)
-                || voix.find(v => v.lang === 'fr-FR')
-                || voix.find(v => v.lang.startsWith('fr')) || null;
-    if (voixFR) u.voice = voixFR;
-    synth.speak(u);
-  }
-  const v = synth.getVoices();
-  if (v.length > 0) parler(v);
-  else { synth.onvoiceschanged = () => parler(synth.getVoices()); setTimeout(() => parler(synth.getVoices()), 500); }
+// ── Carte capteur ─────────────────────────────────────────────
+function CarteCapteur({ th, label, valeur, danger, defaillant }) {
+  const bg     = danger ? "#2d1b1b" : defaillant ? "#2d2208" : th.fondCarte;
+  const border = danger ? "#f85149" : defaillant ? "#e3b341" : th.bordure;
+  const color  = danger ? "#f85149" : defaillant ? "#e3b341" : th.accent;
+  return (
+    <View style={[styles.carte, { backgroundColor: bg, borderColor: border }]}>
+      <Text style={[styles.carteValeur, { color }]}>
+        {defaillant ? "⚠️" : valeur}
+      </Text>
+      <Text style={[styles.carteLabel, { color: th.texteFaible }]}>{label}</Text>
+    </View>
+  );
 }
-</script>
-</body>
-</html>"""
 
-@app.route("/dashboard")
-def dashboard():
-    niveau_class = "ok"
-    if derniere_donnee.get("analyse"):
-        n = derniere_donnee["analyse"].get("niveau", "OK")
-        niveau_class = {"DANGER":"danger","ATTENTION":"warning","OK":"ok"}.get(n,"ok")
-    return render_template_string(
-        DASHBOARD_HTML,
-        data=derniere_donnee if derniere_donnee else None,
-        niveau_class=niveau_class
-    )
-
-# ── ROUTE 8 — / ───────────────────────────────────────────────
-@app.route("/")
-def index():
-    return """<h2 style='font-family:monospace;color:#58a6ff;padding:20px'>
-    🛡️ SENTINELLE-IA API v4<br><br>
-    <a href='/dashboard' style='color:#3fb950'>→ Dashboard temps réel</a><br>
-    <a href='/test-vocal' style='color:#e3b341'>→ Test vocal</a><br>
-    <a href='/dernieres-donnees' style='color:#8b949e'>→ Dernières données JSON</a>
-    </h2>"""
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=False)
+// ── Styles ────────────────────────────────────────────────────
+const styles = StyleSheet.create({
+  content:            { padding: 16, paddingTop: 50, paddingBottom: 40 },
+  entete:             { flexDirection: "row", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 16 },
+  titre:              { fontSize: 20, fontWeight: "bold" },
+  sousTitre:          { fontSize: 11, marginTop: 2 },
+  controles:          { alignItems: "flex-end", gap: 8 },
+  switchGroupe:       { flexDirection: "row", alignItems: "center", gap: 4 },
+  switchLabel:        { fontSize: 12, fontWeight: "bold", color: "#8b949e" },
+  switchPetit:        { transform: [{ scaleX: 0.85 }, { scaleY: 0.85 }] },
+  boutonTheme:        { flexDirection: "row", alignItems: "center", borderWidth: 1, borderRadius: 20, paddingHorizontal: 10, paddingVertical: 5, gap: 4 },
+  labelTheme:         { fontSize: 12 },
+  carteStatut:        { borderWidth: 2, borderRadius: 12, padding: 16, marginBottom: 12, alignItems: "center" },
+  texteStatut:        { fontSize: 18, fontWeight: "bold" },
+  messageAnalyse:     { fontSize: 13, marginTop: 6, textAlign: "center" },
+  titreSectionPlat:   { fontSize: 12, fontWeight: "bold", marginBottom: 8, marginTop: 4, textTransform: "uppercase", letterSpacing: 1 },
+  grille:             { flexDirection: "row", flexWrap: "wrap", justifyContent: "space-between", marginBottom: 16 },
+  carte:              { borderWidth: 1, borderRadius: 10, padding: 12, width: "48%", marginBottom: 8, alignItems: "center" },
+  carteValeur:        { fontSize: 20, fontWeight: "bold" },
+  carteLabel:         { fontSize: 11, marginTop: 4, textAlign: "center" },
+  carteVocale:        { borderWidth: 1, borderRadius: 12, padding: 20, alignItems: "center", marginBottom: 16 },
+  titreSection:       { fontSize: 15, fontWeight: "bold", marginBottom: 12 },
+  indicateurEtat:     { borderWidth: 1, borderRadius: 20, paddingHorizontal: 16, paddingVertical: 8, marginBottom: 14, width: "100%" },
+  texteEtat:          { fontSize: 13, fontWeight: "bold", textAlign: "center" },
+  boutonMicro:        { borderRadius: 60, width: 110, height: 110, justifyContent: "center", alignItems: "center", marginBottom: 12, elevation: 4 },
+  iconeMicro:         { fontSize: 34 },
+  texteBouton:        { fontSize: 10, color: "white", marginTop: 4, textAlign: "center", paddingHorizontal: 8 },
+  boutonModeTexte:    { borderWidth: 1, borderRadius: 20, paddingHorizontal: 14, paddingVertical: 6, marginBottom: 12 },
+  texteModeTexte:     { fontSize: 12 },
+  zoneTexte:          { width: "100%", flexDirection: "row", gap: 8, marginBottom: 12 },
+  champTexte:         { flex: 1, borderWidth: 1, borderRadius: 8, padding: 10, fontSize: 14 },
+  boutonEnvoyer:      { backgroundColor: "#238636", borderRadius: 8, padding: 10, justifyContent: "center" },
+  texteEnvoyer:       { color: "white", fontWeight: "bold", fontSize: 13 },
+  carteTranscription: { borderWidth: 1, borderRadius: 8, padding: 10, width: "100%", marginBottom: 10 },
+  texteTranscription: { fontSize: 13, fontStyle: "italic" },
+  carteReponse:       { borderWidth: 1, borderRadius: 10, padding: 14, width: "100%" },
+  labelReponse:       { fontSize: 12, fontWeight: "bold", marginBottom: 6 },
+  texteReponse:       { fontSize: 14, lineHeight: 22 },
+  footer:             { fontSize: 11, textAlign: "center", marginTop: 8 },
+});
